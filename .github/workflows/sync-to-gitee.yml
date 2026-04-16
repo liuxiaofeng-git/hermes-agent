@@ -3,9 +3,7 @@ name: Sync to Gitee
 on:
   push:
     branches:
-      - main
-      - master
-      - '**'
+      - main  # 1. 只监听 main 分支的推送
 
 jobs:
   sync-to-gitee:
@@ -14,24 +12,15 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 必须获取所有历史，否则无法镜像
+          fetch-depth: 0
 
-      - name: Sync to Gitee
+      - name: Configure Git
         run: |
-          # 1. 设置 Git 全局配置
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-          # 2. 使用更安全的方式处理远程地址
-          # 注意：这里我们直接使用变量替换，避免特殊字符导致的解析错误
-          REMOTE_REPO="https://${{ secrets.GITEE_USER }}:${{ secrets.GITEE_TOKEN }}@gitee.com/${{ secrets.GITEE_USER }}/hermes-agent.git"
-          
-          # 3. 打印调试信息（可选，不打印敏感信息）
-          echo "Pushing to Gitee..."
-
-          # 4. 执行推送
-          # 先添加远程地址
-          git remote add gitee $REMOTE_REPO
-          
-          # 强制推送所有分支和标签
-          git push --force --mirror gitee
+      - name: Push to Gitee
+        run: |
+          # 2. 关键修改：推送时指定分支映射
+          # 将 GitHub 的 main 分支 推送到 Gitee 的 master 分支
+          git push --force https://${{ secrets.GITEE_USER }}:${{ secrets.GITEE_TOKEN }}@gitee.com/liuxiaofeng-gitee/hermes-agent.git main:master
