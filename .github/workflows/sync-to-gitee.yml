@@ -23,4 +23,4 @@ jobs:
         run: |
           # 2. 关键修改：推送时指定分支映射
           # 将 GitHub 的 main 分支 推送到 Gitee 的 master 分支
-          git push --force https://${{ secrets.GITEE_USER }}:${{ secrets.GITEE_TOKEN }}@gitee.com/liuxiaofeng-gitee/hermes-agent.git main:master
+          git push --force https://${{ secrets.GITEE_USER }}:${{ secrets.GITEE_TOKEN }}@gitee.com/liuxiaofeng-gitee/hermes-agent.git main:main
