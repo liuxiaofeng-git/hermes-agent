@@ -693,6 +693,10 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     - If it looks like a session ID (contains underscore + hex), try direct lookup first.
     - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
     - Falls back to the other method if the first doesn't match.
+    - If the resolved session is a compression root, follow the chain forward
+      to the latest continuation. Users who remember the old root ID (e.g.
+      from an exit summary printed before the bug fix, or from notes) get
+      resumed at the live tip instead of a stale parent with no messages.
     """
     try:
         from hermes_state import SessionDB
@@ -701,14 +705,23 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
 
         # Try as exact session ID first
         session = db.get_session(name_or_id)
+        resolved_id: Optional[str] = None
         if session:
-            db.close()
-            return session["id"]
+            resolved_id = session["id"]
+        else:
+            # Try as title (with auto-latest for lineage)
+            resolved_id = db.resolve_session_by_title(name_or_id)
 
-        # Try as title (with auto-latest for lineage)
-        session_id = db.resolve_session_by_title(name_or_id)
+        if resolved_id:
+            # Project forward through compression chain so resumes land on
+            # the live tip instead of a dead compressed parent.
+            try:
+                resolved_id = db.get_compression_tip(resolved_id) or resolved_id
+            except Exception:
+                pass
+
         db.close()
-        return session_id
+        return resolved_id
     except Exception:
         pass
     return None
@@ -897,6 +910,10 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     _ensure_tui_node()
 
     def _node_bin(bin: str) -> str:
+        if bin == "node":
+            env_node = os.environ.get("HERMES_NODE")
+            if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
+                return env_node
         path = shutil.which(bin)
         if not path:
             print(f"{bin} not found — install Node.js to use the TUI.")
@@ -2347,7 +2364,7 @@ def _model_flow_google_gemini_cli(_config, current_model=""):
         return
 
     models = list(_PROVIDER_MODELS.get("google-gemini-cli") or [])
-    default = current_model or (models[0] if models else "gemini-2.5-flash")
+    default = current_model or (models[0] if models else "gemini-3-flash-preview")
     selected = _prompt_model_selection(models, current_model=default)
     if selected:
         _save_model_choice(selected)
@@ -3969,7 +3986,7 @@ def _model_flow_anthropic(config, current_model=""):
 
         elif choice == "2":
             print()
-            print("  Get an API key at: https://console.anthropic.com/settings/keys")
+            print("  Get an API key at: https://platform.claude.com/settings/keys")
             print()
             try:
                 import getpass
@@ -4985,8 +5002,187 @@ def _update_node_dependencies() -> None:
             print(f"    {stderr.splitlines()[-1]}")
 
 
+class _UpdateOutputStream:
+    """Stream wrapper used during ``hermes update`` to survive terminal loss.
+
+    Wraps the process's original stdout/stderr so that:
+
+    * Every write is also mirrored to an append-only log file
+      (``~/.hermes/logs/update.log``) that users can inspect after the
+      terminal disconnects.
+    * Writes to the original stream that fail with ``BrokenPipeError`` /
+      ``OSError`` / ``ValueError`` (closed file) no longer cascade into
+      process exit — the update keeps going, only the on-screen output
+      stops.
+
+    Combined with ``SIGHUP -> SIG_IGN`` installed by
+    ``_install_hangup_protection``, this makes ``hermes update`` safe to
+    run in a plain SSH session that might disconnect mid-install.
+    """
+
+    def __init__(self, original, log_file):
+        self._original = original
+        self._log = log_file
+        self._original_broken = False
+
+    def write(self, data):
+        # Mirror to the log file first — it's the most reliable destination.
+        if self._log is not None:
+            try:
+                self._log.write(data)
+            except Exception:
+                # Log errors should never abort the update.
+                pass
+
+        if self._original_broken:
+            return len(data) if isinstance(data, (str, bytes)) else 0
+
+        try:
+            return self._original.write(data)
+        except (BrokenPipeError, OSError, ValueError):
+            # Terminal vanished (SSH disconnect, shell close).  Stop trying
+            # to write to it, but keep the update running.
+            self._original_broken = True
+            return len(data) if isinstance(data, (str, bytes)) else 0
+
+    def flush(self):
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                pass
+        if self._original_broken:
+            return
+        try:
+            self._original.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self._original_broken = True
+
+    def isatty(self):
+        if self._original_broken:
+            return False
+        try:
+            return self._original.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        # Some tools probe fileno(); defer to the underlying stream and let
+        # callers handle failures (same behaviour as the unwrapped stream).
+        return self._original.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _install_hangup_protection(gateway_mode: bool = False):
+    """Protect ``cmd_update`` from SIGHUP and broken terminal pipes.
+
+    Users commonly run ``hermes update`` in an SSH session or a terminal
+    that may close mid-install.  Without protection, ``SIGHUP`` from the
+    terminal kills the Python process during ``pip install`` and leaves
+    the venv half-installed; the documented workaround ("use screen /
+    tmux") shouldn't be required for something as routine as an update.
+
+    Protections installed:
+
+    1. ``SIGHUP`` is set to ``SIG_IGN``.  POSIX preserves ``SIG_IGN``
+       across ``exec()``, so pip and git subprocesses also stop dying on
+       hangup.
+    2. ``sys.stdout`` / ``sys.stderr`` are wrapped to mirror output to
+       ``~/.hermes/logs/update.log`` and to silently absorb
+       ``BrokenPipeError`` when the terminal vanishes.
+
+    ``SIGINT`` (Ctrl-C) and ``SIGTERM`` (systemd shutdown) are
+    **intentionally left alone** — those are legitimate cancellation
+    signals the user or OS sent on purpose.
+
+    In gateway mode (``hermes update --gateway``) the update is already
+    spawned detached from a terminal, so this function is a no-op.
+
+    Returns a dict that ``cmd_update`` can pass to
+    ``_finalize_update_output`` on exit.  Returning a dict rather than a
+    tuple keeps the call site forward-compatible with future additions.
+    """
+    state = {
+        "prev_stdout": sys.stdout,
+        "prev_stderr": sys.stderr,
+        "log_file": None,
+        "installed": False,
+    }
+
+    if gateway_mode:
+        return state
+
+    import signal as _signal
+
+    # (1) Ignore SIGHUP for the remainder of this process.
+    if hasattr(_signal, "SIGHUP"):
+        try:
+            _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
+        except (ValueError, OSError):
+            # Called from a non-main thread — not fatal.  The update still
+            # runs, just without hangup protection.
+            pass
+
+    # (2) Mirror output to update.log and wrap stdio for broken-pipe
+    # tolerance.  Any failure here is non-fatal; we just skip the wrap.
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        logs_dir = get_hermes_home() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = logs_dir / "update.log"
+        log_file = open(log_path, "a", buffering=1, encoding="utf-8")
+
+        import datetime as _dt
+
+        log_file.write(
+            f"\n=== hermes update started "
+            f"{_dt.datetime.now().isoformat(timespec='seconds')} ===\n"
+        )
+
+        state["log_file"] = log_file
+        sys.stdout = _UpdateOutputStream(state["prev_stdout"], log_file)
+        sys.stderr = _UpdateOutputStream(state["prev_stderr"], log_file)
+        state["installed"] = True
+    except Exception:
+        # Leave stdio untouched on any setup failure.  Update continues
+        # without mirroring.
+        state["log_file"] = None
+
+    return state
+
+
+def _finalize_update_output(state):
+    """Restore stdio and close the update.log handle opened by ``_install_hangup_protection``."""
+    if not state:
+        return
+    if state.get("installed"):
+        try:
+            sys.stdout = state.get("prev_stdout", sys.stdout)
+        except Exception:
+            pass
+        try:
+            sys.stderr = state.get("prev_stderr", sys.stderr)
+        except Exception:
+            pass
+    log_file = state.get("log_file")
+    if log_file is not None:
+        try:
+            log_file.flush()
+            log_file.close()
+        except Exception:
+            pass
+
+
 def cmd_update(args):
-    """Update Hermes Agent to the latest version."""
+    """Update Hermes Agent to the latest version.
+
+    Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
+    runs the update, then restores stdio on the way out (even on
+    ``sys.exit`` or unhandled exceptions).
+    """
     from hermes_cli.config import is_managed, managed_error
 
     if is_managed():
@@ -4994,6 +5190,20 @@ def cmd_update(args):
         return
 
     gateway_mode = getattr(args, "gateway", False)
+
+    # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
+    # writes to a closed stdout.  No-op in gateway mode.  See
+    # _install_hangup_protection for rationale.
+    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    try:
+        _cmd_update_impl(args, gateway_mode=gateway_mode)
+    finally:
+        _finalize_update_output(_update_io_state)
+
+
+def _cmd_update_impl(args, gateway_mode: bool):
+    """Body of ``cmd_update`` — kept separate so the wrapper can always
+    restore stdio even on ``sys.exit``."""
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -6029,11 +6239,12 @@ def cmd_dashboard(args):
         import uvicorn  # noqa: F401
     except ImportError:
         print("Web UI dependencies not installed.")
-        print("Install them with:  pip install hermes-agent[web]")
+        print(f"Install them with:  {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'")
         sys.exit(1)
 
-    if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
-        sys.exit(1)
+    if "HERMES_WEB_DIST" not in os.environ:
+        if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
+            sys.exit(1)
 
     from hermes_cli.web_server import start_server
 
@@ -6804,6 +7015,13 @@ For more help on a command:
     wh_sub.add_argument(
         "--secret", default="", help="HMAC secret (auto-generated if omitted)"
     )
+    wh_sub.add_argument(
+        "--deliver-only",
+        action="store_true",
+        help="Skip the agent — deliver the rendered prompt directly as the "
+        "message. Zero LLM cost. Requires --deliver to be a real target "
+        "(not 'log').",
+    )
 
     webhook_subparsers.add_parser(
         "list", aliases=["ls"], help="List all dynamic subscriptions"
@@ -7230,6 +7448,17 @@ Examples:
         "-f",
         action="store_true",
         help="Remove existing plugin and reinstall",
+    )
+    _install_enable_group = plugins_install.add_mutually_exclusive_group()
+    _install_enable_group.add_argument(
+        "--enable",
+        action="store_true",
+        help="Auto-enable the plugin after install (skip confirmation prompt)",
+    )
+    _install_enable_group.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="Install disabled (skip confirmation prompt); enable later with `hermes plugins enable <name>`",
     )
 
     plugins_update = plugins_subparsers.add_parser(

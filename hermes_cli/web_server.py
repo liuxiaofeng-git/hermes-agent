@@ -56,10 +56,10 @@ try:
 except ImportError:
     raise SystemExit(
         "Web UI requires fastapi and uvicorn.\n"
-        "Run 'hermes web' to auto-install, or: pip install hermes-agent[web]"
+        f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
     )
 
-WEB_DIST = Path(__file__).parent / "web_dist"
+WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
 app = FastAPI(title="Hermes Agent", version=__version__)
@@ -232,8 +232,8 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "checkpoints": "agent",
     "approvals": "security",
     "human_delay": "display",
-    "smart_model_routing": "agent",
     "dashboard": "display",
+    "code_execution": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -1958,6 +1958,8 @@ async def update_config_raw(body: RawConfigUpdate):
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):
     from hermes_state import SessionDB
+    from agent.insights import InsightsEngine
+
     db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
@@ -1997,8 +1999,24 @@ async def get_usage_analytics(days: int = 30):
             FROM sessions WHERE started_at > ?
         """, (cutoff,))
         totals = dict(cur3.fetchone())
+        insights_report = InsightsEngine(db).generate(days=days)
+        skills = insights_report.get("skills", {
+            "summary": {
+                "total_skill_loads": 0,
+                "total_skill_edits": 0,
+                "total_skill_actions": 0,
+                "distinct_skills_used": 0,
+            },
+            "top_skills": [],
+        })
 
-        return {"daily": daily, "by_model": by_model, "totals": totals, "period_days": days}
+        return {
+            "daily": daily,
+            "by_model": by_model,
+            "totals": totals,
+            "period_days": days,
+            "skills": skills,
+        }
     finally:
         db.close()
 
