@@ -1968,6 +1968,15 @@ class GatewayRunner:
                 agent.close()
         except Exception:
             pass
+        # Auxiliary async clients (session_search/web/vision/etc.) live in a
+        # process-global cache and are created inside worker threads. Clean up
+        # any entries whose event loop is now dead so their httpx transports do
+        # not accumulate across gateway turns.
+        try:
+            from agent.auxiliary_client import cleanup_stale_async_clients
+            cleanup_stale_async_clients()
+        except Exception:
+            pass
 
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
@@ -2930,6 +2939,19 @@ class GatewayRunner:
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
             _kill_tool_subprocesses("final-cleanup")
+
+            # Reap the process-global auxiliary-client cache once at the very
+            # end of teardown.  Per-turn cleanup runs in _cleanup_agent_resources
+            # for each active agent, but clients bound to worker-thread loops
+            # that died with their ThreadPoolExecutor (notably cron ticks) only
+            # get swept here.  Without this, long-running gateways accumulate
+            # async httpx transports until they hit EMFILE on macOS's default
+            # RLIMIT_NOFILE=256.  See #14210.
+            try:
+                from agent.auxiliary_client import shutdown_cached_clients
+                shutdown_cached_clients()
+            except Exception as _e:
+                logger.debug("shutdown_cached_clients error: %s", _e)
 
             # Close SQLite session DBs so the WAL write lock is released.
             # Without this, --replace and similar restart flows leave the
@@ -8461,6 +8483,7 @@ class GatewayRunner:
             The enriched message string with vision descriptions prepended.
         """
         from tools.vision_tools import vision_analyze_tool
+        from agent.memory_manager import sanitize_context
 
         analysis_prompt = (
             "Describe everything visible in this image in thorough detail. "
@@ -8479,6 +8502,7 @@ class GatewayRunner:
                 result = json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
+                    description = sanitize_context(description)
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "

@@ -43,6 +43,7 @@ AUTHOR_MAP = {
     "teknium1@gmail.com": "teknium1",
     "teknium@nousresearch.com": "teknium1",
     "127238744+teknium1@users.noreply.github.com": "teknium1",
+    "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
     "johnnncenaaa77@gmail.com": "johnncenae",
     "focusflow.app.help@gmail.com": "yes999zc",
     "343873859@qq.com": "DrStrangerUJN",
@@ -63,6 +64,7 @@ AUTHOR_MAP = {
     "yoimexex@gmail.com": "Yoimex",
     "6548898+romanornr@users.noreply.github.com": "romanornr",
     "foxion37@gmail.com": "foxion37",
+    "bloodcarter@gmail.com": "bloodcarter",
     # contributors (from noreply pattern)
     "david.vv@icloud.com": "davidvv",
     "wangqiang@wangqiangdeMac-mini.local": "xiaoqiang243",
@@ -555,6 +557,12 @@ AUTHOR_MAP = {
     "mor.aleksandr@yahoo.com": "MorAlekss",
     "ash@users.noreply.github.com": "ash",
     "andrewho.sf@gmail.com": "andrewhosf",
+    # April 2026 Honcho bug-fix consolidation (#15381)
+    "HiddenPuppy@users.noreply.github.com": "HiddenPuppy",
+    "code@sasha.id": "sasha-id",
+    "dontcallmejames@users.noreply.github.com": "dontcallmejames",
+    "hekaru.agent@gmail.com": "hekaru-agent",
+    "jas9000@gmail.com": "twozle",
 }
 
 
