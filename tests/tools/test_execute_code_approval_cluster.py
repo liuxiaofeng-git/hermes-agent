@@ -111,8 +111,10 @@ def gw_session(monkeypatch):
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-    # Force manual mode regardless of host config.
+    # Force manual mode regardless of host config and disable any process-level
+    # yolo inherited from the developer's live environment.
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
 
     session_key = "cluster-test-session"
     token = A.set_current_session_key(session_key)
@@ -176,6 +178,53 @@ def test_guard_gateway_user_approves_is_one_shot(gw_session):
     assert A.is_approved(gw_session, "execute_code") is False
 
 
+def test_guard_gateway_user_approves_session_persists(gw_session):
+    """'Approve session' stores session-level approval (#39275)."""
+    _register_resolver(gw_session, "session")
+    res = A.check_execute_code_guard("import os; print(1)", "local")
+    assert res["approved"] is True
+    assert res.get("user_approved") is True
+    # Session approval should now be stored.
+    assert A.is_approved(gw_session, "execute_code") is True
+    # Subsequent calls should auto-approve without prompting.
+    res2 = A.check_execute_code_guard("import os; print(2)", "local")
+    assert res2["approved"] is True
+    # Cleanup
+    with A._lock:
+        s = A._session_approved.get(gw_session, set())
+        s.discard("execute_code")
+
+
+def test_guard_gateway_user_approves_always_persists(gw_session):
+    """'Always' stores permanent approval (#39275)."""
+    _register_resolver(gw_session, "always")
+    res = A.check_execute_code_guard("import os; print(1)", "local")
+    assert res["approved"] is True
+    assert res.get("user_approved") is True
+    # Permanent approval should now be stored.
+    assert A.is_approved(gw_session, "execute_code") is True
+    # Cleanup
+    with A._lock:
+        A._permanent_approved.discard("execute_code")
+        s = A._session_approved.get(gw_session, set())
+        s.discard("execute_code")
+
+
+def test_guard_session_approval_short_circuits_prompt(gw_session):
+    """Once session-approved, execute_code skips the approval prompt (#39275)."""
+    # Manually set session approval.
+    A.approve_session(gw_session, "execute_code")
+    try:
+        # Even with a denier registered, the is_approved check short-circuits.
+        _register_resolver(gw_session, "deny")
+        res = A.check_execute_code_guard("import os", "local")
+        assert res["approved"] is True
+    finally:
+        with A._lock:
+            s = A._session_approved.get(gw_session, set())
+            s.discard("execute_code")
+
+
 def test_guard_gateway_user_denies_blocks(gw_session):
     _register_resolver(gw_session, "deny")
     res = A.check_execute_code_guard("import os", "local")
@@ -184,11 +233,21 @@ def test_guard_gateway_user_denies_blocks(gw_session):
     assert res["user_consent"] is False
 
 
-def test_guard_gateway_timeout_blocks(gw_session, monkeypatch):
+@pytest.mark.parametrize(
+    "approval_config",
+    [
+        {"timeout": 0},
+        {"timeout": 0, "gateway_timeout": 300},
+    ],
+    ids=["shared-timeout-only", "shared-timeout-is-canonical"],
+)
+def test_guard_gateway_wait_uses_canonical_timeout(
+    gw_session, monkeypatch, approval_config
+):
     # Register a callback that never resolves; force an immediate timeout.
     with A._lock:
         A._gateway_notify_cbs[gw_session] = lambda _d: None
-    monkeypatch.setattr(A, "_get_approval_config", lambda: {"gateway_timeout": 0})
+    monkeypatch.setattr(A, "_get_approval_config", lambda: approval_config)
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False
     assert res["outcome"] == "timeout"
