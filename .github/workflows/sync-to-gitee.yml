@@ -3,7 +3,17 @@ name: Sync to Gitee
 on:
   push:
     branches:
-      - main  # 1. 只监听 main 分支的推送
+      - main
+    # 忽略工作流文件变更，避免自触发和并发冲突
+    paths-ignore:
+      - '.github/workflows/sync-to-gitee.yml'
+      - '.github/workflows/install-update-e2e.yml'
+  workflow_dispatch:  # 保留手动触发能力
+
+# 并发控制：同一时间只运行一个同步任务
+concurrency:
+  group: sync-to-gitee
+  cancel-in-progress: true
 
 jobs:
   sync-to-gitee:
@@ -14,6 +24,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # 重置工作区，确保干净，解决 working tree is dirty 报错
+      - name: Ensure clean working tree
+        run: |
+          git checkout -- .
+          git clean -fd
+
       - name: Configure Git
         run: |
           git config --global user.name "GitHub Actions"
@@ -21,6 +37,4 @@ jobs:
 
       - name: Push to Gitee
         run: |
-          # 2. 关键修改：推送时指定分支映射
-          # 将 GitHub 的 main 分支 推送到 Gitee 的 master 分支
           git push --force https://${{ secrets.GITEE_USER }}:${{ secrets.GITEE_TOKEN }}@gitee.com/liuxiaofeng-gitee/hermes-agent.git main:main
